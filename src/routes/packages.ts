@@ -114,7 +114,7 @@ router.post("/", upload.single("file"), async (req, res) => {
       description: description || "",
       architectures,
       latestVersion: version || "1.0.0",
-      size: req.file ? formatSize(req.file.size) : null,
+      size: req.file ? formatSize(req.file.size) : "",
       status: "draft",
     });
     await pkgRepo.save(pkg);
@@ -136,7 +136,7 @@ router.post("/", upload.single("file"), async (req, res) => {
         pvRepo.create({
           packageId: pkg.id,
           version: version || "1.0.0",
-          architecture: architectures[0] || "x86_64",
+          architecture: architectures[0] || "amd64",
           status: "stable",
           size: formatSize(req.file.size),
           checksum,
@@ -248,7 +248,7 @@ router.post("/:id/versions", upload.single("file"), async (req, res) => {
     const pv = pvRepo.create({
       packageId: pkg.id,
       version,
-      architecture: architecture || "x86_64",
+      architecture: architecture || "amd64",
       status: versionStatus || "stable",
       size: formatSize(req.file.size),
       checksum,
