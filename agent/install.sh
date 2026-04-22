@@ -6,6 +6,12 @@
 # ─────────────────────────────────────────────────────────
 set -e
 
+# ── Ensure running as root ──
+if [ "$EUID" -ne 0 ]; then
+  echo "→ Re-launching with sudo (root required to install packages)..."
+  exec sudo bash "$0" "$@"
+fi
+
 # ── Configuration ──
 # Change SERVER_URL to the IP of the PC running the backend.
 # To find it: on the server PC, run `ipconfig` (Windows) or `hostname -I` (Linux)
@@ -105,6 +111,11 @@ cat > "$AGENT_SCRIPT" <<'AGENT_EOF'
 # Polls the server for deployment tasks, downloads & installs packages.
 # ─────────────────────────────────────────────────────────
 
+# ── Ensure running as root ──
+if [ "$EUID" -ne 0 ]; then
+  exec sudo bash "$0" "$@"
+fi
+
 CONFIG_FILE="/opt/download-center-agent/agent.conf"
 LOG_FILE="/opt/download-center-agent/agent.log"
 
@@ -134,6 +145,21 @@ report_status() {
     }" >/dev/null 2>&1
 }
 
+install_deb() {
+  local deb_path="$1"
+  local dc_id="$2"
+  log "   Installing .deb with dpkg: $deb_path"
+  if dpkg -i "$deb_path" >> "$LOG_FILE" 2>&1; then
+    # Fix any missing dependencies automatically
+    apt-get install -f -y >> "$LOG_FILE" 2>&1 || true
+    log "   ✓ .deb installed successfully"
+    report_status "$dc_id" "success"
+  else
+    log "   ✗ dpkg install failed"
+    report_status "$dc_id" "failed" "dpkg -i exited with error"
+  fi
+}
+
 process_task() {
   local task="$1"
   local dc_id=$(echo "$task" | jq -r '.deploymentClientId')
@@ -150,45 +176,90 @@ process_task() {
   local dest_dir="$PACKAGES_DIR/$pkg_name/$version"
   mkdir -p "$dest_dir"
 
-  # Download the package file
   local download_url="$SERVER_URL/api/agents/download/$pkg_id/$version?apiKey=$API_KEY"
-  local file_path="$dest_dir/$pkg_name-$version.zip"
+  local headers_file="$dest_dir/headers.tmp"
+  local tmp_file="$dest_dir/download.tmp"
 
-  if ! curl -sf -o "$file_path" "$download_url"; then
+  if ! curl -sf -D "$headers_file" -o "$tmp_file" "$download_url"; then
     log "   ✗ Download failed"
     report_status "$dc_id" "failed" "Download failed — file not available on server"
     return
   fi
 
-  log "   ✓ Downloaded to $file_path"
+  # Detect original filename from Content-Disposition header
+  local orig_filename
+  orig_filename=$(grep -i 'content-disposition' "$headers_file" \
+    | sed -E 's/.*filename="?([^"\r]+)"?.*/\1/' | tr -d '\r' | tr -d '\n')
+  [ -z "$orig_filename" ] && orig_filename="${pkg_name}-${version}"
+  rm -f "$headers_file"
+
+  local file_ext="${orig_filename##*.}"
+  local file_path="$dest_dir/$orig_filename"
+  mv "$tmp_file" "$file_path"
+
+  log "   ✓ Downloaded: $orig_filename"
 
   # Report: installing
   report_status "$dc_id" "installing"
-  log "   Installing..."
+  log "   Installing (detected type: .$file_ext)..."
 
-  # Unzip the package
-  if unzip -o -q "$file_path" -d "$dest_dir" 2>/dev/null; then
-    log "   ✓ Extracted to $dest_dir"
-  else
-    log "   (Not a zip file, kept as-is)"
-  fi
-
-  # Check if there's an install.sh inside
-  if [ -f "$dest_dir/install.sh" ]; then
-    log "   Running install.sh..."
-    chmod +x "$dest_dir/install.sh"
-    if bash "$dest_dir/install.sh" >> "$LOG_FILE" 2>&1; then
-      log "   ✓ install.sh completed successfully"
-      report_status "$dc_id" "success"
-    else
-      log "   ✗ install.sh failed"
-      report_status "$dc_id" "failed" "install.sh exited with error"
-    fi
-  else
-    # No install script — just downloading was the goal
-    log "   ✓ Package deployed (no install.sh found, files extracted)"
-    report_status "$dc_id" "success"
-  fi
+  case "$file_ext" in
+    deb)
+      install_deb "$file_path" "$dc_id"
+      ;;
+    sh)
+      log "   Running shell script..."
+      chmod +x "$file_path"
+      if bash "$file_path" >> "$LOG_FILE" 2>&1; then
+        log "   ✓ Script completed successfully"
+        report_status "$dc_id" "success"
+      else
+        log "   ✗ Script failed"
+        report_status "$dc_id" "failed" "install script exited with error"
+      fi
+      ;;
+    zip)
+      if unzip -o -q "$file_path" -d "$dest_dir" 2>/dev/null; then
+        log "   ✓ Extracted zip to $dest_dir"
+      else
+        log "   ✗ Failed to extract zip"
+        report_status "$dc_id" "failed" "Failed to extract zip archive"
+        return
+      fi
+      # Priority: install.sh > .deb inside zip > success as-is
+      if [ -f "$dest_dir/install.sh" ]; then
+        log "   Found install.sh inside zip, running..."
+        chmod +x "$dest_dir/install.sh"
+        if bash "$dest_dir/install.sh" >> "$LOG_FILE" 2>&1; then
+          log "   ✓ install.sh completed successfully"
+          report_status "$dc_id" "success"
+        else
+          log "   ✗ install.sh failed"
+          report_status "$dc_id" "failed" "install.sh exited with error"
+        fi
+      else
+        local deb_file
+        deb_file=$(find "$dest_dir" -maxdepth 2 -name '*.deb' | head -1)
+        if [ -n "$deb_file" ]; then
+          log "   Found .deb inside zip: $(basename "$deb_file")"
+          install_deb "$deb_file" "$dc_id"
+        else
+          log "   ✓ Package deployed (files extracted, no installer found)"
+          report_status "$dc_id" "success"
+        fi
+      fi
+      ;;
+    *)
+      # Unknown extension — probe with dpkg to see if it's really a .deb
+      if dpkg -I "$file_path" &>/dev/null; then
+        log "   File probed as .deb package"
+        install_deb "$file_path" "$dc_id"
+      else
+        log "   ✓ Package deployed (unknown format, files kept in $dest_dir)"
+        report_status "$dc_id" "success"
+      fi
+      ;;
+  esac
 
   log "   Done: $pkg_name v$version"
 }
@@ -237,7 +308,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=$USER
+User=root
 ExecStart=/bin/bash $AGENT_SCRIPT
 Restart=always
 RestartSec=10
